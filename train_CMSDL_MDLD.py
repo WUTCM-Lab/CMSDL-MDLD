@@ -36,9 +36,7 @@ from MDLD import (
 )
 
 
-# ======================
-# 小工具
-# ======================
+
 def ensure_dir(p):
     if not os.path.exists(p):
         os.makedirs(p)
@@ -63,9 +61,6 @@ class Timer:
         return 0.0 if self.t0 is None else (time.time() - self.t0)
 
 
-# ======================
-# 随机种子
-# ======================
 def set_seed(seed: int = 2025):
     random.seed(seed)
     np.random.seed(seed)
@@ -80,10 +75,6 @@ def _seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-
-# ======================
-# 数据增强
-# ======================
 def build_augment_pipelines():
     global_aug1 = T.Compose([
         T.RandomHorizontalFlip(p=0.5),
@@ -113,9 +104,7 @@ def get_fixed_final_weights(base_w_sm: float, base_w_cm: float, base_w_token: fl
     return float(base_w_sm), float(base_w_cm), float(base_w_token)
 
 
-# ======================
-# 训练循环：CMSDL-MSDL
-# ======================
+
 def train_one_epoch(
     model,
     loader,
@@ -158,7 +147,6 @@ def train_one_epoch(
             t1 = t1.float()
             t2 = t2.float()
 
-            # ===== 增强 =====
             t1_v1 = apply_batch_aug(t1, global_aug1)
             t1_v2 = apply_batch_aug(t1, global_aug2)
             t2_v1 = apply_batch_aug(t2, global_aug1)
@@ -172,7 +160,6 @@ def train_one_epoch(
             B = t1_v1.size(0)
             num_chunks = math.ceil(B / student_chunk_size)
 
-            # ===== teacher 整批前向 =====
             with torch.no_grad():
                 teacher_out_t1 = model.teacher_forward(
                     t1_v1,
@@ -217,7 +204,6 @@ def train_one_epoch(
             batch_weighted_sm_value = 0.0
             batch_weighted_tok_value = 0.0
 
-            # ===== student 分块反传 =====
             for start in range(0, B, student_chunk_size):
                 end = min(start + student_chunk_size, B)
 
@@ -265,11 +251,6 @@ def train_one_epoch(
                 ) * 0.25
 
                 # ===== 3) layer-wise discrete token distillation =====
-                # 用 teacher 的 layer token id 作为目标，
-                # student 在每层预测 token 分类。
-                # 为了兼顾同模态稳定与跨模态共享表示，这里采用：
-                # - 同模态 token distillation: t1_v2 <- t1 teacher, t2_v2 <- t2 teacher
-                # - 跨模态 token distillation: t1_v1 <- t2 teacher, t2_v1 <- t1 teacher
                 tok_sm = (
                     layer_token_ce_loss(
                         s_out_t1_v2["layer_token_logits"],
@@ -296,7 +277,6 @@ def train_one_epoch(
                     )
                 ) * 0.5
 
-                # token loss 也做成 anchor + cross-modal 的结构
                 loss_tok = 0.5 * tok_sm + 0.5 * tok_cm
 
                 loss = (
@@ -322,7 +302,6 @@ def train_one_epoch(
 
             opt.step()
 
-            # ===== 更新 teacher 与 center =====
             with torch.no_grad():
                 model.update_teacher(m=teacher_m)
                 model.update_center_logits(torch.cat([logit_t1, logit_t2], dim=0), momentum=center_m)
@@ -372,9 +351,6 @@ def train_one_epoch(
     }
 
 
-# ======================
-# 覆盖可视化辅助
-# ======================
 def to_3ch_image(img: np.ndarray, fallback_gray: np.ndarray) -> np.ndarray:
     if img is None:
         base = np.stack([fallback_gray, fallback_gray, fallback_gray], axis=2)
@@ -414,9 +390,6 @@ def overlay_tp_fp_fn(base_bgr: np.ndarray,
     return combined, tp_vis, fp_vis, fn_vis
 
 
-# ======================
-# 验证
-# ======================
 @torch.no_grad()
 def validate_change_map(model, loader, o_h, o_w, gt, vis_dir, device, x1_full=None, x2_full=None, threshold_mode="fixed", fixed_threshold=66.3):
     model.eval()
@@ -489,9 +462,6 @@ def validate_change_map(model, loader, o_h, o_w, gt, vis_dir, device, x1_full=No
     return cmi_u8, bcm, dict(AUC=AUC, OA=OA, KC=KC, F1=F1, threshold=float(thr))
 
 
-# ======================
-# 实验日志、CSV 表格与曲线
-# ======================
 def write_csv(path, rows, fieldnames=None):
     """Write a list of dictionaries to CSV (UTF-8 with BOM for Excel)."""
     if not rows:
@@ -628,10 +598,6 @@ def save_run_summary(history, output_dir, args):
     write_csv(os.path.join(output_dir, "run_summary.csv"), [row])
 
 
-
-# ======================
-# 主程序
-# ======================
 def main():
     parser = argparse.ArgumentParser()
 
@@ -654,7 +620,6 @@ def main():
     )
     parser.add_argument('--fixed_threshold', default=66.3, type=float)
 
-    # DINO / CMSDL
     parser.add_argument('--out_dim', default=256, type=int)
     parser.add_argument('--head_hidden', default=512, type=int)
     parser.add_argument('--head_bottleneck', default=256, type=int)
@@ -663,11 +628,10 @@ def main():
     parser.add_argument('--teacher_m', default=0.996, type=float)
     parser.add_argument('--center_m', default=0.9, type=float)
 
-    # CMSDL-MSD loss weights
+    # loss weights
     parser.add_argument('--w_cm', default=0.30, type=float)
     parser.add_argument('--w_sm', default=0.10, type=float)
 
-    # DistilMOS-style layer token distillation
     parser.add_argument('--w_token', default=0.10, type=float)
     parser.add_argument('--token_dim', default=128, type=int)
     parser.add_argument('--token_hidden', default=256, type=int)
@@ -772,7 +736,6 @@ def main():
         momentum=0.9,
     )
 
-    # 层权重：可让深层略强一些
     token_layer_weights = [0.7, 0.9, 1.1, 1.3]
 
     history = []
@@ -803,7 +766,6 @@ def main():
             token_layer_weights=token_layer_weights,
         )
 
-        # Sanity checks: do not silently accept invalid or collapsed loss values.
         for loss_key in ("loss", "loss_cm", "loss_sm", "loss_tok"):
             if not np.isfinite(train_stats[loss_key]):
                 raise FloatingPointError(
