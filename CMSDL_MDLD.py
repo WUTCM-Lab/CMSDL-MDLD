@@ -1,9 +1,11 @@
 import math
-from typing import Optional, List, Dict
+from typing import Optional, List, Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, p: int = 1):
@@ -18,7 +20,9 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
+
 class Encoder(nn.Module):
+
     def __init__(
         self,
         in_channels: int,
@@ -54,7 +58,13 @@ class Encoder(nn.Module):
         return f4
 
 
+# =========================
+# DINO Head
+# =========================
 class DINOHead(nn.Module):
+    """
+    MLP -> bottleneck -> L2 norm -> weight norm linear
+    """
     def __init__(
         self,
         in_dim: int,
@@ -87,7 +97,7 @@ class DINOHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 4:
-            x = x.mean(dim=[2, 3])
+            x = x.mean(dim=[2, 3])  # GAP -> (B,C)
         z = self._mlp(x)
         out = self.last_layer(z)
         return out
@@ -102,7 +112,14 @@ class DINOHead(nn.Module):
         logits = logits.view(B, H, W, self.out_dim).permute(0, 3, 1, 2).contiguous()
         return logits
 
+
+# =========================
+# Layer-wise projector + token predictor
+# =========================
 class LayerProjector(nn.Module):
+    """
+    将不同层通道投影到统一 token hidden dim。
+    """
     def __init__(self, in_dim: int, proj_dim: int):
         super().__init__()
         self.proj = nn.Sequential(
@@ -116,6 +133,7 @@ class LayerProjector(nn.Module):
 
 
 class TokenPredictor(nn.Module):
+
     def __init__(self, in_dim: int, hidden_dim: int, num_tokens: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -130,6 +148,7 @@ class TokenPredictor(nn.Module):
         return self.net(x)
 
 
+
 class OnlineCodebook(nn.Module):
 
     def __init__(self, num_tokens: int, token_dim: int, ema_momentum: float = 0.95):
@@ -138,37 +157,41 @@ class OnlineCodebook(nn.Module):
         self.token_dim = token_dim
         self.ema_momentum = ema_momentum
 
-        self.register_buffer(
-            "prototypes",
-            F.normalize(torch.randn(num_tokens, token_dim), dim=-1)
-        )
+        self.register_buffer("prototypes", F.normalize(torch.randn(num_tokens, token_dim), dim=-1))
         self.register_buffer("cluster_size", torch.zeros(num_tokens))
 
     @torch.no_grad()
     def assign(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, D), assume normalized or near-normalized
+        return: token ids, shape (B,)
+        """
         x = F.normalize(x, dim=-1)
         p = F.normalize(self.prototypes, dim=-1)
-        sim = x @ p.t()
+        sim = x @ p.t()  # (B, K)
         token_ids = sim.argmax(dim=-1)
         return token_ids
 
     @torch.no_grad()
     def update(self, x: torch.Tensor, token_ids: torch.Tensor):
+
         x = F.normalize(x, dim=-1)
         K = self.num_tokens
         D = self.token_dim
-        device = x.device
-        dtype = x.dtype
 
-        proto_sum = torch.zeros(K, D, device=device, dtype=dtype)
-        count = torch.zeros(K, device=device, dtype=dtype)
+        device = x.device
+        proto_sum = torch.zeros(K, D, device=device, dtype=x.dtype)
+        count = torch.zeros(K, device=device, dtype=x.dtype)
 
         proto_sum.index_add_(0, token_ids, x)
-        ones = torch.ones_like(token_ids, dtype=dtype)
+        ones = torch.ones_like(token_ids, dtype=x.dtype)
         count.index_add_(0, token_ids, ones)
 
         m = self.ema_momentum
+
+
         self.cluster_size.mul_(m).add_(count, alpha=1.0 - m)
+
 
         used = count > 0
         if used.any():
@@ -178,8 +201,8 @@ class OnlineCodebook(nn.Module):
             self.prototypes[used] = updated
 
 
-
 class DINOStudentTeacher(nn.Module):
+
     def __init__(
         self,
         in_channels: int = 3,
@@ -196,6 +219,7 @@ class DINOStudentTeacher(nn.Module):
     ):
         super().__init__()
 
+        # ---------- student backbone ----------
         self.student_backbone = Encoder(
             in_channels=in_channels,
             out_channels=feat_dim,
@@ -212,6 +236,7 @@ class DINOStudentTeacher(nn.Module):
             out_dim=out_dim,
         )
 
+        # ---------- teacher backbone ----------
         self.teacher_backbone = Encoder(
             in_channels=in_channels,
             out_channels=feat_dim,
@@ -228,6 +253,7 @@ class DINOStudentTeacher(nn.Module):
             out_dim=out_dim,
         )
 
+        # ---------- layer-wise distillation modules ----------
         layer_channels = self.student_backbone.out_channels_list
         self.num_layers_for_token = len(layer_channels)
 
@@ -324,8 +350,8 @@ class DINOStudentTeacher(nn.Module):
             token_feats_all = []
 
             for i, f in enumerate(feats):
-                pooled = f.mean(dim=[2, 3])
-                z = self.teacher_layer_projectors[i](pooled)
+                pooled = f.mean(dim=[2, 3])  # (B, C_i)
+                z = self.teacher_layer_projectors[i](pooled)  # (B, token_dim)
                 z = F.normalize(z, dim=-1)
                 token_ids = self.layer_codebooks[i].assign(z)
                 if update_codebook:
@@ -357,64 +383,17 @@ class DINOStudentTeacher(nn.Module):
         if return_layer_token_logits:
             token_logits_all = []
             token_embs_all = []
-            token_probs_all = []
-            token_ids_all = []
-
             for i, f in enumerate(feats):
                 pooled = f.mean(dim=[2, 3])
                 z = self.student_layer_projectors[i](pooled)
                 z = F.normalize(z, dim=-1)
                 token_logits = self.layer_token_predictors[i](z)
-                token_probs = F.softmax(token_logits, dim=-1)
-                token_ids = token_probs.argmax(dim=-1)
-
                 token_logits_all.append(token_logits)
                 token_embs_all.append(z)
-                token_probs_all.append(token_probs)
-                token_ids_all.append(token_ids)
-
             out["layer_token_logits"] = token_logits_all
             out["layer_token_embs"] = token_embs_all
-            out["layer_token_probs"] = token_probs_all
-            out["layer_token_ids"] = token_ids_all
 
         return out
-
-    @torch.no_grad()
-    def inference_forward(
-        self,
-        x: torch.Tensor,
-        T_student: float = 0.1,
-    ) -> Dict[str, object]:
-        feat, feats = self.student_backbone(x, return_features=True)
-        proto_logits = self.student_head(feat) / T_student
-        proto_probs = F.softmax(proto_logits, dim=-1)
-
-        token_probs_all = []
-        token_ids_all = []
-        token_embs_all = []
-
-        for i, f in enumerate(feats):
-            pooled = f.mean(dim=[2, 3])
-            z = self.student_layer_projectors[i](pooled)
-            z = F.normalize(z, dim=-1)
-            token_logits = self.layer_token_predictors[i](z)
-            token_probs = F.softmax(token_logits, dim=-1)
-            token_ids = token_probs.argmax(dim=-1)
-
-            token_embs_all.append(z)
-            token_probs_all.append(token_probs)
-            token_ids_all.append(token_ids)
-
-        return {
-            "feat": feat,
-            "feats": feats,
-            "proto_logits": proto_logits,
-            "proto_probs": proto_probs,
-            "layer_token_embs": token_embs_all,
-            "layer_token_probs": token_probs_all,
-            "layer_token_ids": token_ids_all,
-        }
 
     @staticmethod
     @torch.no_grad()
@@ -432,6 +411,9 @@ class DINOStudentTeacher(nn.Module):
         return conf.clamp(0.0, 1.0)
 
 
+# =========================
+# LOSS
+# =========================
 def dino_loss(student_logp: torch.Tensor, teacher_p: torch.Tensor) -> torch.Tensor:
     return torch.sum(-teacher_p.detach() * student_logp, dim=-1).mean()
 
@@ -454,6 +436,7 @@ def layer_token_ce_loss(
     teacher_token_ids: List[torch.Tensor],
     layer_weights: Optional[List[float]] = None,
 ) -> torch.Tensor:
+
     assert len(student_token_logits) == len(teacher_token_ids)
     n = len(student_token_logits)
     if layer_weights is None:
