@@ -4,19 +4,31 @@ import time
 import random
 import json
 import math
+import csv
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+import numpy as np
+import torch
+import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 import cv2
 from tqdm import tqdm
 from sklearn import metrics
-from skimage.filters.thresholding import threshold_otsu
 import scipy.io as io
+
 from utils.data import Data_Loader, to_normalization
 from utils.loss import *
 from utils.Evaluation import Evaluation
 
-from model.CMSDL_MDLD import (
+from model.MDLD import (
     DINOStudentTeacher,
     dino_loss,
     weighted_dino_loss,
@@ -24,7 +36,9 @@ from model.CMSDL_MDLD import (
 )
 
 
-
+# ======================
+# 小工具
+# ======================
 def ensure_dir(p):
     if not os.path.exists(p):
         os.makedirs(p)
@@ -48,6 +62,10 @@ class Timer:
     def stop(self):
         return 0.0 if self.t0 is None else (time.time() - self.t0)
 
+
+# ======================
+# 随机种子
+# ======================
 def set_seed(seed: int = 2025):
     random.seed(seed)
     np.random.seed(seed)
@@ -62,6 +80,10 @@ def _seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+
+# ======================
+# 数据增强
+# ======================
 def build_augment_pipelines():
     global_aug1 = T.Compose([
         T.RandomHorizontalFlip(p=0.5),
@@ -83,88 +105,17 @@ def apply_batch_aug(batch: torch.Tensor, aug) -> torch.Tensor:
     return torch.stack([aug(img) for img in batch], dim=0)
 
 
-def cosine_rampup(current_epoch: int, total_epochs: int, start_value: float, end_value: float):
-    if total_epochs <= 1:
-        return end_value
-    ratio = (current_epoch - 1) / (total_epochs - 1)
-    ratio = float(np.clip(ratio, 0.0, 1.0))
-    value = end_value + 0.5 * (start_value - end_value) * (1.0 + math.cos(math.pi * ratio))
-    return value
-
-def get_dynamic_distill_weights(epoch: int, total_epochs: int, base_w_sm: float, base_w_cm: float):
-    w_sm_epoch = base_w_sm
-    w_cm_epoch = cosine_rampup(
-        current_epoch=epoch,
-        total_epochs=total_epochs,
-        start_value=base_w_cm * 0.35,
-        end_value=base_w_cm,
-    )
-    return w_sm_epoch, w_cm_epoch
-
-def get_dynamic_token_weight(epoch: int, total_epochs: int, base_w_token: float):
-    return cosine_rampup(
-        current_epoch=epoch,
-        total_epochs=total_epochs,
-        start_value=base_w_token * 0.25,
-        end_value=base_w_token,
-    )
+# ======================
+# Fixed-final objective weighting
+# ======================
+def get_fixed_final_weights(base_w_sm: float, base_w_cm: float, base_w_token: float):
+    """Return constant objective weights used in every training epoch."""
+    return float(base_w_sm), float(base_w_cm), float(base_w_token)
 
 
-@torch.no_grad()
-def symmetric_kl_from_probs(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    p, q: (B, K)
-    return: (B,)
-    """
-    p = p.clamp_min(eps)
-    q = q.clamp_min(eps)
-    kl_pq = torch.sum(p * (torch.log(p) - torch.log(q)), dim=-1)
-    kl_qp = torch.sum(q * (torch.log(q) - torch.log(p)), dim=-1)
-    return 0.5 * (kl_pq + kl_qp)
-
-@torch.no_grad()
-def js_divergence_from_probs(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    p, q: (B, K)
-    return: (B,)
-    """
-    p = p.clamp_min(eps)
-    q = q.clamp_min(eps)
-    m = 0.5 * (p + q)
-    kl_pm = torch.sum(p * (torch.log(p) - torch.log(m)), dim=-1)
-    kl_qm = torch.sum(q * (torch.log(q) - torch.log(m)), dim=-1)
-    return 0.5 * (kl_pm + kl_qm)
-
-@torch.no_grad()
-def normalized_l2_per_sample(x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    x1, x2: (B, D)
-    return: (B,)
-    """
-    x1 = x1 / (x1.norm(dim=-1, keepdim=True) + eps)
-    x2 = x2 / (x2.norm(dim=-1, keepdim=True) + eps)
-    return torch.norm(x1 - x2, p=2, dim=-1)
-
-@torch.no_grad()
-def pooled_feature_distance(feat1: torch.Tensor, feat2: torch.Tensor) -> torch.Tensor:
-    """
-    feat1, feat2: (B,C,H,W)
-    """
-    p1 = feat1.mean(dim=[2, 3])
-    p2 = feat2.mean(dim=[2, 3])
-    return normalized_l2_per_sample(p1, p2)
-
-@torch.no_grad()
-def flattened_feature_distance(feat1: torch.Tensor, feat2: torch.Tensor) -> torch.Tensor:
-    """
-    feat1, feat2: (B,C,H,W)
-    """
-    B = feat1.size(0)
-    f1 = feat1.view(B, -1)
-    f2 = feat2.view(B, -1)
-    return normalized_l2_per_sample(f1, f2)
-
-
+# ======================
+# 训练循环：CMSDL-MSDL
+# ======================
 def train_one_epoch(
     model,
     loader,
@@ -186,15 +137,10 @@ def train_one_epoch(
     model.train()
     global_aug1, global_aug2 = build_augment_pipelines()
 
-    w_sm_epoch, w_cm_epoch = get_dynamic_distill_weights(
-        epoch=epoch,
-        total_epochs=total_epochs,
+    # Fixed-final: all objective weights are applied unchanged from Epoch 1.
+    w_sm_epoch, w_cm_epoch, w_token_epoch = get_fixed_final_weights(
         base_w_sm=dino_w_sm,
         base_w_cm=dino_w_cm,
-    )
-    w_token_epoch = get_dynamic_token_weight(
-        epoch=epoch,
-        total_epochs=total_epochs,
         base_w_token=dino_w_token,
     )
 
@@ -202,13 +148,17 @@ def train_one_epoch(
     running_cm = 0.0
     running_sm = 0.0
     running_tok = 0.0
+    running_weighted_cm = 0.0
+    running_weighted_sm = 0.0
+    running_weighted_tok = 0.0
     running_conf = 0.0
 
-    with tqdm(total=len(loader), desc=f"Train (CMSDL-MSDL++) [Epoch {epoch}]", ncols=180) as t:
+    with tqdm(total=len(loader), desc=f"Train (CMSDL-MSDL) [Epoch {epoch}]", ncols=180) as t:
         for batch_idx, (t1, t2, _) in enumerate(loader):
             t1 = t1.float()
             t2 = t2.float()
 
+            # ===== 增强 =====
             t1_v1 = apply_batch_aug(t1, global_aug1)
             t1_v2 = apply_batch_aug(t1, global_aug2)
             t2_v1 = apply_batch_aug(t2, global_aug1)
@@ -222,6 +172,7 @@ def train_one_epoch(
             B = t1_v1.size(0)
             num_chunks = math.ceil(B / student_chunk_size)
 
+            # ===== teacher 整批前向 =====
             with torch.no_grad():
                 teacher_out_t1 = model.teacher_forward(
                     t1_v1,
@@ -262,7 +213,11 @@ def train_one_epoch(
             batch_loss_cm_value = 0.0
             batch_loss_sm_value = 0.0
             batch_loss_tok_value = 0.0
+            batch_weighted_cm_value = 0.0
+            batch_weighted_sm_value = 0.0
+            batch_weighted_tok_value = 0.0
 
+            # ===== student 分块反传 =====
             for start in range(0, B, student_chunk_size):
                 end = min(start + student_chunk_size, B)
 
@@ -276,6 +231,7 @@ def train_one_epoch(
                 w_cm_from_q2 = cm_w_t1_from_t2[start:end]
                 w_cm_from_q1 = cm_w_t2_from_t1[start:end]
 
+                # student outputs
                 s_out_t1_v1 = model.student_forward_logits(
                     s_t1_v1, T=t_student, return_feat=True, return_layer_token_logits=True
                 )
@@ -294,13 +250,13 @@ def train_one_epoch(
                 p_t2_v1 = s_out_t2_v1["log_probs"]
                 p_t2_v2 = s_out_t2_v2["log_probs"]
 
-                # same-modal anchor
+                # ===== 1) same-modal anchor =====
                 loss_sm = (
                     dino_loss(p_t1_v2, q1) +
                     dino_loss(p_t2_v2, q2)
                 ) * 0.5
 
-                # cross-modal fine alignment
+                # ===== 2) cross-modal fine alignment =====
                 loss_cm = (
                     weighted_dino_loss(p_t1_v1, q2, w_cm_from_q2) +
                     weighted_dino_loss(p_t1_v2, q2, w_cm_from_q2) +
@@ -308,7 +264,12 @@ def train_one_epoch(
                     weighted_dino_loss(p_t2_v2, q1, w_cm_from_q1)
                 ) * 0.25
 
-                # layer-wise token distillation
+                # ===== 3) layer-wise discrete token distillation =====
+                # 用 teacher 的 layer token id 作为目标，
+                # student 在每层预测 token 分类。
+                # 为了兼顾同模态稳定与跨模态共享表示，这里采用：
+                # - 同模态 token distillation: t1_v2 <- t1 teacher, t2_v2 <- t2 teacher
+                # - 跨模态 token distillation: t1_v1 <- t2 teacher, t2_v1 <- t1 teacher
                 tok_sm = (
                     layer_token_ce_loss(
                         s_out_t1_v2["layer_token_logits"],
@@ -335,6 +296,7 @@ def train_one_epoch(
                     )
                 ) * 0.5
 
+                # token loss 也做成 anchor + cross-modal 的结构
                 loss_tok = 0.5 * tok_sm + 0.5 * tok_cm
 
                 loss = (
@@ -349,6 +311,9 @@ def train_one_epoch(
                 batch_loss_cm_value += float(loss_cm.item())
                 batch_loss_sm_value += float(loss_sm.item())
                 batch_loss_tok_value += float(loss_tok.item())
+                batch_weighted_cm_value += float((w_cm_epoch * loss_cm).item())
+                batch_weighted_sm_value += float((w_sm_epoch * loss_sm).item())
+                batch_weighted_tok_value += float((w_token_epoch * loss_tok).item())
 
             nn.utils.clip_grad_norm_(model.student_backbone.parameters(), max_norm=5.0)
             nn.utils.clip_grad_norm_(model.student_head.parameters(), max_norm=5.0)
@@ -357,6 +322,7 @@ def train_one_epoch(
 
             opt.step()
 
+            # ===== 更新 teacher 与 center =====
             with torch.no_grad():
                 model.update_teacher(m=teacher_m)
                 model.update_center_logits(torch.cat([logit_t1, logit_t2], dim=0), momentum=center_m)
@@ -365,11 +331,17 @@ def train_one_epoch(
             batch_loss_cm_value /= max(1, num_chunks)
             batch_loss_sm_value /= max(1, num_chunks)
             batch_loss_tok_value /= max(1, num_chunks)
+            batch_weighted_cm_value /= max(1, num_chunks)
+            batch_weighted_sm_value /= max(1, num_chunks)
+            batch_weighted_tok_value /= max(1, num_chunks)
 
             running += batch_loss_value
             running_cm += batch_loss_cm_value
             running_sm += batch_loss_sm_value
             running_tok += batch_loss_tok_value
+            running_weighted_cm += batch_weighted_cm_value
+            running_weighted_sm += batch_weighted_sm_value
+            running_weighted_tok += batch_weighted_tok_value
             running_conf += float(mean_conf.item())
 
             t.set_postfix({
@@ -390,6 +362,9 @@ def train_one_epoch(
         "loss_cm": running_cm / denom,
         "loss_sm": running_sm / denom,
         "loss_tok": running_tok / denom,
+        "loss_cm_weighted": running_weighted_cm / denom,
+        "loss_sm_weighted": running_weighted_sm / denom,
+        "loss_tok_weighted": running_weighted_tok / denom,
         "mean_conf": running_conf / denom,
         "w_cm_epoch": w_cm_epoch,
         "w_sm_epoch": w_sm_epoch,
@@ -397,7 +372,9 @@ def train_one_epoch(
     }
 
 
-
+# ======================
+# 覆盖可视化辅助
+# ======================
 def to_3ch_image(img: np.ndarray, fallback_gray: np.ndarray) -> np.ndarray:
     if img is None:
         base = np.stack([fallback_gray, fallback_gray, fallback_gray], axis=2)
@@ -437,120 +414,41 @@ def overlay_tp_fp_fn(base_bgr: np.ndarray,
     return combined, tp_vis, fp_vis, fn_vis
 
 
-
+# ======================
+# 验证
+# ======================
 @torch.no_grad()
-def validate_change_map(
-    model,
-    loader,
-    o_h,
-    o_w,
-    gt,
-    vis_dir,
-    device,
-    x1_full=None,
-    x2_full=None,
-    t_student_infer: float = 0.1,
-    feature_layer_weights=None,
-    token_layer_weights=None,
-    alpha_feat: float = 0.55,
-    beta_proto: float = 0.25,
-    gamma_tok: float = 0.20,
-    threshold_mode: str = "otsu",
-    manual_thr: float = 66.3,
-    percentile_thr: float = 85.0,
-):
-
+def validate_change_map(model, loader, o_h, o_w, gt, vis_dir, device, x1_full=None, x2_full=None, threshold_mode="fixed", fixed_threshold=66.3):
     model.eval()
 
-    if feature_layer_weights is None:
-        feature_layer_weights = [0.7, 0.9, 1.1, 1.3]
-    if token_layer_weights is None:
-        token_layer_weights = [0.7, 0.9, 1.1, 1.3]
-
-    feature_scores = []
-    proto_scores = []
-    token_scores = []
-    final_scores = []
-
-    with tqdm(total=len(loader), desc='Validate (CM++)', ncols=170, colour='cyan') as t:
+    res = []
+    with tqdm(total=len(loader), desc='Validate (CM)', ncols=150, colour='cyan') as t:
         for (t1, t2, _) in loader:
             t1 = t1.to(device).float()
             t2 = t2.to(device).float()
 
-            out1 = model.inference_forward(t1, T_student=t_student_infer)
-            out2 = model.inference_forward(t2, T_student=t_student_infer)
+            f1 = model.student_backbone(t1)
+            f2 = model.student_backbone(t2)
 
-            feat_dist_layers = []
-            feat_weight_sum = 0.0
-
-            for i, (f1, f2) in enumerate(zip(out1["feats"], out2["feats"])):
-                w = float(feature_layer_weights[i])
-
-                d_pool = pooled_feature_distance(f1, f2)
-                d_flat = flattened_feature_distance(f1, f2)
-                d = 0.5 * d_pool + 0.5 * d_flat
-
-                feat_dist_layers.append(w * d)
-                feat_weight_sum += w
-
-            feat_score = sum(feat_dist_layers) / max(feat_weight_sum, 1e-6)
-
-            proto_score = js_divergence_from_probs(out1["proto_probs"], out2["proto_probs"])
-
-            token_dist_layers = []
-            token_weight_sum = 0.0
-
-            for i, (p1, p2, id1, id2) in enumerate(zip(
-                out1["layer_token_probs"],
-                out2["layer_token_probs"],
-                out1["layer_token_ids"],
-                out2["layer_token_ids"],
-            )):
-                w = float(token_layer_weights[i])
-
-                d_soft = js_divergence_from_probs(p1, p2)
-                d_hard = (id1 != id2).float()
-                d = 0.7 * d_soft + 0.3 * d_hard
-
-                token_dist_layers.append(w * d)
-                token_weight_sum += w
-
-            token_score = sum(token_dist_layers) / max(token_weight_sum, 1e-6)
-
-            final_score = alpha_feat * feat_score + beta_proto * proto_score + gamma_tok * token_score
-
-            feature_scores.extend(feat_score.cpu().numpy().tolist())
-            proto_scores.extend(proto_score.cpu().numpy().tolist())
-            token_scores.extend(token_score.cpu().numpy().tolist())
-            final_scores.extend(final_score.cpu().numpy().tolist())
-
+            B = t1.size(0)
+            d = l2_distance(f1.view(B, -1), f2.view(B, -1))
+            res.extend(d.cpu().numpy().tolist())
             t.update(1)
 
-    # reshape
-    feat_map = minmax01(np.array(feature_scores)).reshape(o_h, o_w)
-    proto_map = minmax01(np.array(proto_scores)).reshape(o_h, o_w)
-    token_map = minmax01(np.array(token_scores)).reshape(o_h, o_w)
-    cmi = minmax01(np.array(final_scores)).reshape(o_h, o_w)
-
-    feat_u8 = to_uint8_01(feat_map)
-    proto_u8 = to_uint8_01(proto_map)
-    token_u8 = to_uint8_01(token_map)
+    cmi = minmax01(np.array(res)).reshape(o_h, o_w)
     cmi_u8 = to_uint8_01(cmi)
+    cv2.imwrite(os.path.join(vis_dir, 'CMI_DINO.png'), cmi_u8)
 
-    cv2.imwrite(os.path.join(vis_dir, 'CMI_feature_multi.png'), feat_u8)
-    cv2.imwrite(os.path.join(vis_dir, 'CMI_proto_js.png'), proto_u8)
-    cv2.imwrite(os.path.join(vis_dir, 'CMI_token_multi.png'), token_u8)
-    cv2.imwrite(os.path.join(vis_dir, 'CMI_CMSDL_MSDL_PP.png'), cmi_u8)
-
-    if threshold_mode.lower() == "otsu":
-        thr = float(threshold_otsu(cmi_u8))
-    elif threshold_mode.lower() == "percentile":
-        thr = float(np.percentile(cmi_u8, percentile_thr))
+    if threshold_mode == "otsu":
+        thr, bcm = cv2.threshold(
+            cmi_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+    elif threshold_mode == "fixed":
+        thr = float(fixed_threshold)
+        bcm = (cmi_u8 > thr).astype(np.uint8) * 255
     else:
-        thr = float(manual_thr)
-
-    bcm = (cmi_u8 > thr).astype(np.uint8) * 255
-    cv2.imwrite(os.path.join(vis_dir, 'BCM_CMSDL_MSDL_PP.png'), bcm)
+        raise ValueError("threshold_mode must be 'fixed' or 'otsu'.")
+    cv2.imwrite(os.path.join(vis_dir, 'BCM_DINO.png'), bcm)
 
     evaler = Evaluation(gt.astype(np.uint8), bcm)
     OA, KC, AA = evaler.Classification_indicators()
@@ -587,60 +485,187 @@ def validate_change_map(
     cv2.imwrite(os.path.join(vis_dir, "Overlay_FP_only_v2.png"), overlay_fp2)
     cv2.imwrite(os.path.join(vis_dir, "Overlay_FN_only_v2.png"), overlay_fn2)
 
-    print(
-        f'[VAL][CMSDL-MSDL++] '
-        f'AUC={AUC:.4f} OA={OA:.2f} KC={KC:.2f} F1={F1:.2f} '
-        f'thr={thr:.2f} mode={threshold_mode}'
-    )
+    print(f'[VAL][CMSDL-MSDL] AUC={AUC:.4f} OA={OA:.2f} KC={KC:.2f} F1={F1:.2f}')
+    return cmi_u8, bcm, dict(AUC=AUC, OA=OA, KC=KC, F1=F1, threshold=float(thr))
 
-    outputs = {
-        "feat_u8": feat_u8,
-        "proto_u8": proto_u8,
-        "token_u8": token_u8,
-        "cmi_u8": cmi_u8,
-        "bcm_u8": bcm,
-    }
-    stats = {
-        "AUC": float(AUC),
-        "OA": float(OA),
-        "KC": float(KC),
-        "F1": float(F1),
-        "threshold": float(thr),
-        "alpha_feat": float(alpha_feat),
-        "beta_proto": float(beta_proto),
-        "gamma_tok": float(gamma_tok),
-    }
-    return outputs, stats
 
+# ======================
+# 实验日志、CSV 表格与曲线
+# ======================
+def write_csv(path, rows, fieldnames=None):
+    """Write a list of dictionaries to CSV (UTF-8 with BOM for Excel)."""
+    if not rows:
+        return
+    if fieldnames is None:
+        fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_run_plots(history, output_dir):
+    """Save per-run training-loss, evaluation-metric, and constant-weight curves."""
+    if not history:
+        return
+    if plt is None:
+        print("[WARN] matplotlib is not installed; CSV/JSON logs were saved, but plots were skipped.")
+        return
+
+    epochs = [int(x["epoch"]) for x in history]
+
+    # Training losses: objective, raw branch losses, and weighted contributions.
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    axes[0, 0].plot(epochs, [x["train_loss"] for x in history], marker="o", markersize=3)
+    axes[0, 0].set_title("Total Training Objective")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].set_ylabel("Loss")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    for key, label in [
+        ("train_loss_cm", "Cross-modal (raw)"),
+        ("train_loss_sm", "Same-modal (raw)"),
+        ("train_loss_tok", "Token (raw)"),
+    ]:
+        axes[0, 1].plot(epochs, [x[key] for x in history], marker="o", markersize=2, label=label)
+    axes[0, 1].set_title("Unweighted Loss Components")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].set_ylabel("Loss")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    for key, label in [
+        ("train_loss_cm_weighted", "w_cm × L_cm"),
+        ("train_loss_sm_weighted", "w_sm × L_sm"),
+        ("train_loss_tok_weighted", "w_token × L_token"),
+    ]:
+        axes[1, 0].plot(epochs, [x[key] for x in history], marker="o", markersize=2, label=label)
+    axes[1, 0].set_title("Weighted Loss Contributions")
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_ylabel("Weighted loss")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    for key, label in [
+        ("w_cm_epoch", "w_cm"),
+        ("w_sm_epoch", "w_sm"),
+        ("w_token_epoch", "w_token"),
+    ]:
+        axes[1, 1].plot(epochs, [x[key] for x in history], marker="o", markersize=2, label=label)
+    axes[1, 1].set_title("Effective Loss Weights")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].set_ylabel("Weight")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "training_loss_curves.png"), dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+    # Evaluation metrics. Separate axes avoid mixing AUC [0, 1] with percentage metrics.
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    metric_specs = [
+        ("AUC", "AUC", "AUC"),
+        ("OA", "Overall Accuracy (OA)", "OA"),
+        ("KC", "Kappa Coefficient (KC)", "KC"),
+        ("F1", "F1 Score", "F1"),
+    ]
+    for ax, (key, title, ylabel) in zip(axes.flat, metric_specs):
+        ax.plot(epochs, [x[key] for x in history], marker="o", markersize=3)
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "evaluation_metrics_curves.png"), dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_history_artifacts(history, output_dir, args):
+    """Persist logs after every epoch, so interrupted runs still retain results."""
+    json_path = os.path.join(output_dir, "history_all.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    csv_rows = []
+    for item in history:
+        row = dict(item)
+        row["weighting_strategy"] = "fixed_final"
+        row["seed"] = args.seed
+        row["threshold_mode"] = args.threshold_mode
+        row["fixed_threshold"] = args.fixed_threshold
+        csv_rows.append(row)
+    write_csv(os.path.join(output_dir, "epoch_metrics.csv"), csv_rows)
+    save_run_plots(history, output_dir)
+
+
+def save_run_summary(history, output_dir, args):
+    """Write final-epoch metrics and best-F1 epoch (diagnostic only)."""
+    if not history:
+        return
+    final = history[-1]
+    best = max(history, key=lambda x: float(x["F1"]))
+    row = {
+        "weighting_strategy": "fixed_final",
+        "seed": int(args.seed),
+        "epochs": int(args.epochs),
+        "threshold_mode": args.threshold_mode,
+        "fixed_threshold": float(args.fixed_threshold),
+        "w_cm_target": float(args.w_cm),
+        "w_sm": float(args.w_sm),
+        "w_token_target": float(args.w_token),
+        "final_epoch": int(final["epoch"]),
+        "final_AUC": float(final["AUC"]),
+        "final_OA": float(final["OA"]),
+        "final_KC": float(final["KC"]),
+        "final_F1": float(final["F1"]),
+        "best_f1_epoch_diagnostic_only": int(best["epoch"]),
+        "best_f1_AUC_diagnostic_only": float(best["AUC"]),
+        "best_f1_OA_diagnostic_only": float(best["OA"]),
+        "best_f1_KC_diagnostic_only": float(best["KC"]),
+        "best_f1_F1_diagnostic_only": float(best["F1"]),
+    }
+    write_csv(os.path.join(output_dir, "run_summary.csv"), [row])
+
+
+
+# ======================
+# 主程序
+# ======================
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--data_name', default='yellow', type=str)
-    parser.add_argument('--t1_path', default='./data/Yellow/yellow_A_1.bmp', type=str)
-    parser.add_argument('--t2_path', default='./data/Yellow/yellow_A_2.bmp', type=str)
-    parser.add_argument('--gt_path', default='./data/Yellow/yellow_A_gt.bmp', type=str)
+    parser.add_argument('--t1_path', default='./data/Yellow/yellow_C_1.bmp', type=str)
+    parser.add_argument('--t2_path', default='./data/Yellow/yellow_C_2.bmp', type=str)
+    parser.add_argument('--gt_path', default='./data/Yellow/yellow_C_gt.bmp', type=str)
 
     parser.add_argument('--t1_nc', default=3, type=int)
     parser.add_argument('--t2_nc', default=1, type=int)
     parser.add_argument('--patch_size', default=11, type=int)
     parser.add_argument('--test_ps', default=11, type=int)
     parser.add_argument('--batch_size', default=512, type=int)
-    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--epochs', default=30, type=int)
     parser.add_argument('--lr', default=1e-2, type=float)
-    parser.add_argument('--vision_path', default='./dino_vision/yellow_A_512_msdlplus/', type=str)
+    parser.add_argument('--vision_path', default='./runs/cmsdl_fixed_final_yellow/', type=str)
+    parser.add_argument(
+        '--threshold_mode', default='fixed', choices=['fixed', 'otsu'], type=str,
+        help='fixed preserves the original code threshold; otsu follows Eq. (36) in the manuscript.'
+    )
+    parser.add_argument('--fixed_threshold', default=66.3, type=float)
 
     # DINO / CMSDL
-    parser.add_argument('--out_dim', default=512, type=int)
+    parser.add_argument('--out_dim', default=256, type=int)
     parser.add_argument('--head_hidden', default=512, type=int)
     parser.add_argument('--head_bottleneck', default=256, type=int)
     parser.add_argument('--t_teacher', default=0.04, type=float)
-    parser.add_argument('--t_student', default=0.1, type=float)
+    parser.add_argument('--t_student', default=0.10, type=float)
     parser.add_argument('--teacher_m', default=0.996, type=float)
     parser.add_argument('--center_m', default=0.9, type=float)
 
-    # loss weights
-    parser.add_argument('--w_cm', default=1.34, type=float)
-    parser.add_argument('--w_sm', default=0.165, type=float)
+    # CMSDL-MSD loss weights
+    parser.add_argument('--w_cm', default=0.30, type=float)
+    parser.add_argument('--w_sm', default=0.10, type=float)
 
     # DistilMOS-style layer token distillation
     parser.add_argument('--w_token', default=0.10, type=float)
@@ -649,27 +674,31 @@ def main():
     parser.add_argument('--num_layer_tokens', default=64, type=int)
     parser.add_argument('--token_codebook_m', default=0.95, type=float)
 
-    # Train details
     parser.add_argument('--student_chunk_size', default=128, type=int)
     parser.add_argument('--conf_power', default=1.0, type=float)
-
-    # Inference fusion weights
-    parser.add_argument('--alpha_feat', default=0.55, type=float)
-    parser.add_argument('--beta_proto', default=0.25, type=float)
-    parser.add_argument('--gamma_tok', default=0.20, type=float)
-
-    # Threshold strategy
-    parser.add_argument('--threshold_mode', default='manual', type=str, choices=['otsu', 'manual', 'percentile'])
-    parser.add_argument('--manual_thr', default=66.3, type=float)
-    parser.add_argument('--percentile_thr', default=84.0, type=float)
-
     parser.add_argument('--seed', default=2025, type=int)
+
     args = parser.parse_args()
+
+    if args.batch_size <= 0 or args.student_chunk_size <= 0:
+        parser.error("batch_size and student_chunk_size must be positive.")
+    if args.epochs <= 0:
+        parser.error("epochs must be positive.")
 
     set_seed(args.seed)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     ensure_dir(args.vision_path)
+
+    config = vars(args).copy()
+    config["weighting_strategy"] = "fixed_final"
+    config["effective_weights"] = {
+        "w_cm": float(args.w_cm),
+        "w_sm": float(args.w_sm),
+        "w_token": float(args.w_token),
+    }
+    with open(os.path.join(args.vision_path, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
 
     train_dataset = Data_Loader(
         args.data_name, args.t1_path, args.t2_path, args.gt_path,
@@ -743,12 +772,16 @@ def main():
         momentum=0.9,
     )
 
-    token_layer_weights_train = [0.7, 0.9, 1.1, 1.3]
-
-    feature_layer_weights_infer = [0.7, 0.9, 1.1, 1.3]
-    token_layer_weights_infer = [0.7, 0.9, 1.1, 1.3]
+    # 层权重：可让深层略强一些
+    token_layer_weights = [0.7, 0.9, 1.1, 1.3]
 
     history = []
+
+    print("\n========== Fixed-final Weighting ==========")
+    print(f"w_cm={args.w_cm:.4f}, w_sm={args.w_sm:.4f}, w_token={args.w_token:.4f}")
+    print(f"These weights remain constant for all {args.epochs} epochs.")
+    print(f"Threshold mode: {args.threshold_mode}; fixed threshold: {args.fixed_threshold}")
+    print("===========================================\n")
 
     for epoch in range(1, args.epochs + 1):
         train_stats = train_one_epoch(
@@ -767,8 +800,21 @@ def main():
             teacher_m=args.teacher_m,
             student_chunk_size=args.student_chunk_size,
             conf_power=args.conf_power,
-            token_layer_weights=token_layer_weights_train,
+            token_layer_weights=token_layer_weights,
         )
+
+        # Sanity checks: do not silently accept invalid or collapsed loss values.
+        for loss_key in ("loss", "loss_cm", "loss_sm", "loss_tok"):
+            if not np.isfinite(train_stats[loss_key]):
+                raise FloatingPointError(
+                    f"Non-finite {loss_key} at epoch {epoch}: {train_stats[loss_key]}"
+                )
+        if train_stats["loss_tok"] <= 1e-12:
+            print(
+                f"[WARNING] Token distillation loss is approximately zero at epoch {epoch}. "
+                "Please inspect teacher token IDs, codebook assignments, and "
+                "layer_token_ce_loss()."
+            )
 
         print(
             f"[EPOCH {epoch}] "
@@ -785,7 +831,7 @@ def main():
         ep_dir = os.path.join(args.vision_path, str(epoch))
         ensure_dir(ep_dir)
 
-        outputs, metrics_dict = validate_change_map(
+        cmi_u8, bcm_u8, metrics_dict = validate_change_map(
             model=model,
             loader=test_loader,
             o_h=o_h,
@@ -795,26 +841,13 @@ def main():
             device=device,
             x1_full=x1_full,
             x2_full=x2_full,
-            t_student_infer=args.t_student,
-            feature_layer_weights=feature_layer_weights_infer,
-            token_layer_weights=token_layer_weights_infer,
-            alpha_feat=args.alpha_feat,
-            beta_proto=args.beta_proto,
-            gamma_tok=args.gamma_tok,
             threshold_mode=args.threshold_mode,
-            manual_thr=args.manual_thr,
-            percentile_thr=args.percentile_thr,
+            fixed_threshold=args.fixed_threshold,
         )
 
         io.savemat(
-            os.path.join(ep_dir, 'CMSDL_MSDL_PP_outputs.mat'),
-            {
-                'feat_u8': outputs['feat_u8'],
-                'proto_u8': outputs['proto_u8'],
-                'token_u8': outputs['token_u8'],
-                'cmi_u8': outputs['cmi_u8'],
-                'bcm_u8': outputs['bcm_u8'],
-            }
+            os.path.join(ep_dir, 'DINO_outputs.mat'),
+            {'cmi_u8': cmi_u8, 'bcm_u8': bcm_u8}
         )
 
         record = {
@@ -823,6 +856,11 @@ def main():
             "train_loss_cm": float(train_stats["loss_cm"]),
             "train_loss_sm": float(train_stats["loss_sm"]),
             "train_loss_tok": float(train_stats["loss_tok"]),
+            "train_loss_cm_weighted": float(train_stats["loss_cm_weighted"]),
+            "train_loss_sm_weighted": float(train_stats["loss_sm_weighted"]),
+            "train_loss_tok_weighted": float(train_stats["loss_tok_weighted"]),
+            "weighting_strategy": "fixed_final",
+            "seed": int(args.seed),
             "mean_conf": float(train_stats["mean_conf"]),
             "w_cm_epoch": float(train_stats["w_cm_epoch"]),
             "w_sm_epoch": float(train_stats["w_sm_epoch"]),
@@ -831,18 +869,23 @@ def main():
         }
         history.append(record)
 
-        with open(os.path.join(ep_dir, 'metrics_CMSDL_MSDL_PP.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(ep_dir, 'metrics_CMSDL_MSDL.json'), 'w', encoding='utf-8') as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
+
+        # Update CSV/JSON tables and curves after every epoch for fault tolerance.
+        save_history_artifacts(history, args.vision_path, args)
 
         torch.save(
             model.state_dict(),
-            os.path.join(ep_dir, f'cmsdl_msdl_pp_epoch{epoch}.pth')
+            os.path.join(ep_dir, f'cmsdl_msdl_epoch{epoch}.pth')
         )
 
-    with open(os.path.join(args.vision_path, 'history_all.json'), 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+    save_history_artifacts(history, args.vision_path, args)
+    save_run_summary(history, args.vision_path, args)
+    torch.save(model.state_dict(), os.path.join(args.vision_path, "final_model.pth"))
 
-    print('Training finished.')
+    print(f"Training finished. Results saved to: {args.vision_path}")
+    print("Key files: epoch_metrics.csv, run_summary.csv, training_loss_curves.png, evaluation_metrics_curves.png, final_model.pth")
 
 if __name__ == '__main__':
     main()
