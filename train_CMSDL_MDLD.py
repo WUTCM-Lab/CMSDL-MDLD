@@ -28,7 +28,7 @@ from utils.data import Data_Loader, to_normalization
 from utils.loss import *
 from utils.Evaluation import Evaluation
 
-from model.MDLD import (
+from MDLD import (
     DINOStudentTeacher,
     dino_loss,
     weighted_dino_loss,
